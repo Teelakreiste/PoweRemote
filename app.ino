@@ -2,7 +2,20 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
-#include "secrets.h"
+
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#elif __has_include("secrets.example.h")
+  #include "secrets.example.h"
+#else
+  const char* HTTP_USERNAME = "admin";
+  const char* HTTP_PASSWORD = "CHANGE_ME";
+  const char* AP_SSID = "PoweRemote-Setup";
+  const char* AP_PASSWORD = "CHANGE_ME_AP";
+  const char* WIFI_SSID = "YOUR_WIFI_SSID";
+  const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#endif
+
 #include <Matter.h>
 #include <MatterEndpoints/MatterOnOffLight.h>
 
@@ -1178,7 +1191,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(300);
     Serial.print(".");
-    digitalWrite(STATUS_LED_PIN, millis() % 1000 < 500 ? HIGH : LOW);  // Parpadear
+    digitalWrite(STATUS_LED_PIN, millis() % 1000 < 500 ? HIGH : LOW);
   }
 
   Serial.println();
