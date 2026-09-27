@@ -2,7 +2,6 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
-#include <Base64.h>
 
 // ============================================================================
 // CONFIGURACIÓN SEGURA
@@ -20,6 +19,11 @@ String password_stored = "";
 // Autenticación HTTP (cambiar en producción)
 const char* http_username = "admin";
 const char* http_password = "CHANGE_ME";
+
+// Modo AP (Access Point)
+const char* ap_ssid = "PoweRemote-Setup";
+const char* ap_password = "CHANGE_ME_AP";
+bool ap_mode = false;
 
 WebServer server(80);
 
@@ -44,6 +48,8 @@ Config config;
 unsigned long last_wifi_check = 0;
 const unsigned long WIFI_CHECK_INTERVAL = 30000;  // Revisar cada 30s
 bool led_state = false;
+unsigned long last_ap_check = 0;
+const unsigned long AP_CHECK_INTERVAL = 10000;  // Revisar red cada 10s en modo AP
 
 // ============================================================================
 // FUNCIONES DE LED Y ESTADO
@@ -138,6 +144,11 @@ void saveConfig(const char* new_ssid, const char* new_password) {
 // ============================================================================
 
 bool checkAuth() {
+  // En modo AP, permitir acceso sin autenticación
+  if (ap_mode) {
+    return true;
+  }
+
   if (!server.hasHeader("Authorization")) {
     server.sendHeader("WWW-Authenticate", "Basic realm=\"Control Remoto PC\"");
     server.send(401, "text/plain", "Autenticación requerida");
@@ -147,17 +158,24 @@ bool checkAuth() {
 
   String auth = server.header("Authorization");
   
+  // Verificar que comience con "Basic "
   if (auth.substring(0, 6) != "Basic ") {
     server.send(401, "text/plain", "Método de autenticación inválido");
+    Serial.println("[AUTH] ❌ Método inválido");
     return false;
   }
 
-  String credentials = auth.substring(6);
-  String expected = String(http_username) + ":" + String(http_password);
-  String encoded_expected = "";
+  // Obtener credenciales codificadas en base64
+  String encoded_credentials = auth.substring(6);
   
-  // Verificar credenciales (comparación simple)
-  if (credentials != base64_encode((uint8_t*)expected.c_str(), expected.length())) {
+  // Crear las credenciales esperadas en formato "usuario:contraseña"
+  String expected_credentials = String(http_username) + ":" + String(http_password);
+  
+  // Codificar manualmente en base64 para comparación
+  // base64: A-Z, a-z, 0-9, +, /, =
+  String encoded_expected = base64_encode_simple((uint8_t*)expected_credentials.c_str(), expected_credentials.length());
+  
+  if (encoded_credentials != encoded_expected) {
     server.send(401, "text/plain", "Credenciales inválidas");
     Serial.println("[AUTH] ❌ Credenciales rechazadas");
     return false;
@@ -167,6 +185,37 @@ bool checkAuth() {
   return true;
 }
 
+// Función simple de codificación base64
+String base64_encode_simple(const uint8_t* data, size_t len) {
+  static const char* base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String encoded = "";
+  
+  for (size_t i = 0; i < len; i += 3) {
+    uint8_t b1 = data[i];
+    uint8_t b2 = (i + 1 < len) ? data[i + 1] : 0;
+    uint8_t b3 = (i + 2 < len) ? data[i + 2] : 0;
+    
+    uint32_t n = ((uint32_t)b1 << 16) | ((uint32_t)b2 << 8) | ((uint32_t)b3);
+    
+    encoded += base64_chars[(n >> 18) & 63];
+    encoded += base64_chars[(n >> 12) & 63];
+    
+    if (i + 1 < len) {
+      encoded += base64_chars[(n >> 6) & 63];
+    } else {
+      encoded += '=';
+    }
+    
+    if (i + 2 < len) {
+      encoded += base64_chars[n & 63];
+    } else {
+      encoded += '=';
+    }
+  }
+  
+  return encoded;
+}
+
 // ============================================================================
 // FUNCIONES DE CONTROL DEL RELÉ
 // ============================================================================
@@ -174,7 +223,7 @@ bool checkAuth() {
 void powerPress() {
   Serial.println("[RELÉ] Pulsación corta (150ms)");
   digitalWrite(RELAY_PIN, LOW);
-  delay(150);
+  delay(300);
   digitalWrite(RELAY_PIN, HIGH);
   Serial.println("[RELÉ] ✓ Pulsación completada");
 }
@@ -279,6 +328,10 @@ button:active {
   background: linear-gradient(135deg, #dc3545, #fd7e14);
 }
 
+.config-btn {
+  background: linear-gradient(135deg, #6f42c1, #5a32a3);
+}
+
 .info {
   color: rgba(255, 255, 255, 0.7);
   font-size: 12px;
@@ -303,6 +356,10 @@ button:active {
     <form action="/forceoff" method="post" style="width: 100%;">
       <button type="submit" class="force-btn">🛑 APAGADO FORZADO</button>
     </form>
+
+    <a href="/config" style="width: 100%; text-decoration: none;">
+      <button type="button" class="config-btn" style="width: 100%;">⚙️ CONFIGURAR WiFi</button>
+    </a>
   </div>
   
   <div class="info">
@@ -401,6 +458,250 @@ void handleStatus() {
   Serial.println("[HTTP] GET /status - JSON enviado");
 }
 
+void handleConfig() {
+  if (!checkAuth()) return;
+
+  if (server.method() == HTTP_GET) {
+    // Mostrar página de configuración
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Configuración WiFi</title>
+
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 20px;
+}
+
+.container {
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  border-radius: 20px;
+  padding: 40px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  max-width: 600px;
+  width: 100%;
+}
+
+h1 {
+  color: white;
+  margin-bottom: 10px;
+  font-size: 28px;
+}
+
+.subtitle {
+  color: rgba(255, 255, 255, 0.7);
+  margin-bottom: 30px;
+  font-size: 14px;
+}
+
+.form-group {
+  margin-bottom: 20px;
+}
+
+label {
+  display: block;
+  color: white;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+input {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  font-size: 14px;
+  transition: border-color 0.3s;
+}
+
+input::placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+input:focus {
+  outline: none;
+  border-color: #4ade80;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.button-group {
+  display: flex;
+  gap: 10px;
+  margin-top: 30px;
+}
+
+button {
+  flex: 1;
+  padding: 12px;
+  border: none;
+  border-radius: 8px;
+  font-weight: bold;
+  font-size: 14px;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+  color: white;
+}
+
+.btn-save {
+  background: linear-gradient(135deg, #28a745, #20c997);
+}
+
+.btn-cancel {
+  background: linear-gradient(135deg, #6c757d, #495057);
+}
+
+button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+.warning {
+  background: rgba(255, 193, 7, 0.2);
+  border: 2px solid rgba(255, 193, 7, 0.5);
+  color: #ffc107;
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  font-size: 13px;
+}
+
+.info {
+  background: rgba(33, 150, 243, 0.2);
+  border: 2px solid rgba(33, 150, 243, 0.5);
+  color: #2196f3;
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  font-size: 13px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+  <h1>⚙️ Configuración de Red</h1>
+  <p class="subtitle">Cambiar credenciales WiFi de forma segura</p>
+  
+  <div class="warning">
+    ⚠️ Cambiar la red WiFi reiniciará la conexión. Espera a que se reconecte.
+  </div>
+  
+  <div class="info">
+    ℹ️ Las credenciales se guardarán en memoria EEPROM de forma persistente.
+  </div>
+
+  <form action="/config" method="POST">
+    <div class="form-group">
+      <label for="ssid">Nombre de Red (SSID)</label>
+      <input type="text" id="ssid" name="ssid" placeholder="Ej: MiRed" required>
+    </div>
+
+    <div class="form-group">
+      <label for="password">Contraseña WiFi</label>
+      <input type="password" id="password" name="password" placeholder="Ej: MiPassword123" required>
+    </div>
+
+    <div class="button-group">
+      <button type="submit" class="btn-save">💾 Guardar</button>
+      <button type="button" class="btn-cancel" onclick="window.location='/'">❌ Cancelar</button>
+    </div>
+  </form>
+</div>
+
+</body>
+</html>
+)rawliteral";
+
+    server.send(200, "text/html", html);
+    Serial.println("[HTTP] GET /config - Página de configuración enviada");
+
+  } else if (server.method() == HTTP_POST) {
+    // Procesar configuración
+    if (!server.hasArg("ssid") || !server.hasArg("password")) {
+      server.send(400, "text/plain", "Error: Parámetros faltantes");
+      Serial.println("[CONFIG] ❌ Error: Parámetros incompletos");
+      return;
+    }
+
+    String new_ssid = server.arg("ssid");
+    String new_password = server.arg("password");
+
+    // Validar longitudes
+    if (new_ssid.length() < 1 || new_ssid.length() > 31) {
+      server.send(400, "text/plain", "Error: SSID debe tener 1-31 caracteres");
+      Serial.println("[CONFIG] ❌ SSID inválido");
+      return;
+    }
+
+    if (new_password.length() < 8 || new_password.length() > 63) {
+      server.send(400, "text/plain", "Error: Contraseña debe tener 8-63 caracteres");
+      Serial.println("[CONFIG] ❌ Contraseña inválida");
+      return;
+    }
+
+    // Guardar configuración
+    saveConfig(new_ssid.c_str(), new_password.c_str());
+
+    String response = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Configuración Guardada</title>
+<style>
+body { font-family: Arial; text-align: center; margin-top: 50px; background: #f0f0f0; }
+.success { background: #28a745; color: white; padding: 20px; border-radius: 10px; margin: 20px auto; max-width: 400px; }
+.info { background: #2196f3; color: white; padding: 15px; margin: 20px auto; max-width: 400px; border-radius: 10px; font-size: 13px; line-height: 1.6; }
+a { color: #667eea; text-decoration: none; margin-top: 20px; display: block; }
+</style>
+</head>
+<body>
+<div class="success">
+  <h2>✓ Configuración guardada</h2>
+  <p>El dispositivo se reiniciará en 3 segundos...</p>
+</div>
+<div class="info">
+  Estará intentando conectar a la nueva red.<br>
+  Si el LED queda fijo, la conexión fue exitosa.
+</div>
+</body>
+</html>
+)rawliteral";
+
+    server.send(200, "text/html", response);
+    Serial.println("[CONFIG] ✓ Nueva red guardada: " + new_ssid);
+    Serial.println("[CONFIG] ⏱️  Reiniciando en 3 segundos...");
+    
+    // Reiniciar después de 3 segundos
+    delay(3000);
+    ESP.restart();
+  }
+}
+
 // ============================================================================
 // WIFI Y RECONEXIÓN
 // ============================================================================
@@ -437,6 +738,91 @@ void reconnectWiFi() {
       Serial.println("[WiFi] ❌ Error en reconexión después de " + String(attempts) + " intentos");
     }
   }
+}
+
+// ============================================================================
+// SALIR DE MODO AP Y CONECTAR A STA
+// ============================================================================
+
+void exitAPMode() {
+  Serial.println("\n[AP→STA] Cambiando de modo Access Point a STA...");
+  
+  ap_mode = false;
+  
+  // Detener servidor
+  server.stop();
+  
+  // Cambiar a modo STA
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid_stored.c_str(), password_stored.c_str());
+  
+  // Esperar conexión con timeout
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
+    Serial.print(".");
+    digitalWrite(STATUS_LED_PIN, millis() % 1000 < 500 ? HIGH : LOW);
+  }
+  
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    printWiFiStatus();
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    Serial.println("[AP→STA] ✓ Cambiado a modo STA exitosamente");
+  } else {
+    Serial.println("[AP→STA] ❌ No se pudo conectar, volviendo a AP...");
+    setupAP();
+    return;
+  }
+  
+  // Reiniciar servidor y reregistrar rutas para STA mode
+  server.begin();
+  registerHTTPRoutes();
+  Serial.println("[HTTP] ✓ Servidor reiniciado en modo STA");
+}
+
+// ============================================================================
+// VERIFICAR DISPONIBILIDAD DE RED EN MODO AP
+// ============================================================================
+
+void checkNetworkInAPMode() {
+  unsigned long now = millis();
+  
+  if (!ap_mode) {
+    return;
+  }
+  
+  if (now - last_ap_check < AP_CHECK_INTERVAL) {
+    return;
+  }
+  
+  last_ap_check = now;
+  
+  Serial.println("[AP] Escaneando redes disponibles...");
+  
+  // Escanear redes WiFi
+  int networks = WiFi.scanNetworks();
+  
+  if (networks == 0) {
+    Serial.println("[AP] ℹ️  No se encontró la red configurada");
+    return;
+  }
+  
+  // Buscar la red configurada
+  for (int i = 0; i < networks; i++) {
+    String ssid = WiFi.SSID(i);
+    
+    if (ssid == ssid_stored) {
+      Serial.println("[AP] ✓ Red disponible: " + ssid);
+      Serial.println("[AP] → Intentando cambiar a modo normal...");
+      exitAPMode();
+      WiFi.scanDelete();
+      return;
+    }
+  }
+  
+  WiFi.scanDelete();
 }
 
 // ============================================================================
@@ -478,6 +864,226 @@ void setupOTA() {
 
   ArduinoOTA.begin();
   Serial.println("[OTA] ✓ Servicio habilitado");
+}
+
+// ============================================================================
+// REGISTRAR RUTAS HTTP
+// ============================================================================
+
+void registerHTTPRoutes() {
+  // Registrar rutas según el modo (se sobrescriben automáticamente)
+  server.on("/", HTTP_GET, ap_mode ? handleAPRoot : handleRoot);
+  server.on("/power", HTTP_POST, handlePower);
+  server.on("/forceoff", HTTP_POST, handleForceOff);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/config", HTTP_GET, handleConfig);
+  server.on("/config", HTTP_POST, handleConfig);
+  server.onNotFound(handleNotFound);
+  
+  Serial.println("[HTTP] ✓ Rutas registradas para modo " + String(ap_mode ? "AP" : "STA"));
+}
+
+// ============================================================================
+// MODO AP (ACCESS POINT / PUNTO DE ACCESO)
+// ============================================================================
+
+void setupAP() {
+  Serial.println("\n[AP] Iniciando modo Access Point...");
+  
+  ap_mode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  
+  IPAddress ap_ip(192, 168, 4, 1);
+  WiFi.softAPConfig(ap_ip, ap_ip, IPAddress(255, 255, 255, 0));
+  
+  Serial.println("[AP] ✓ Red WiFi creada");
+  Serial.println("[AP] SSID: " + String(ap_ssid));
+  Serial.println("[AP] Contraseña: " + String(ap_password));
+  Serial.println("[AP] IP: " + WiFi.softAPIP().toString());
+  Serial.println("[AP] ℹ️  Conectate a esta red y accede a: http://192.168.4.1");
+}
+
+void handleAPRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Configuración PoweRemote</title>
+
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 20px;
+}
+
+.container {
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  border-radius: 20px;
+  padding: 40px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  max-width: 600px;
+  width: 100%;
+}
+
+h1 {
+  color: white;
+  margin-bottom: 10px;
+  font-size: 28px;
+}
+
+.subtitle {
+  color: rgba(255, 255, 255, 0.7);
+  margin-bottom: 30px;
+  font-size: 14px;
+}
+
+.alert {
+  background: rgba(255, 193, 7, 0.2);
+  border: 2px solid rgba(255, 193, 7, 0.5);
+  color: #ffc107;
+  padding: 15px;
+  border-radius: 8px;
+  margin-bottom: 25px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.form-group {
+  margin-bottom: 20px;
+}
+
+label {
+  display: block;
+  color: white;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+input {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  font-size: 14px;
+  transition: border-color 0.3s;
+}
+
+input::placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+input:focus {
+  outline: none;
+  border-color: #4ade80;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.button-group {
+  display: flex;
+  gap: 10px;
+  margin-top: 30px;
+}
+
+button {
+  flex: 1;
+  padding: 12px;
+  border: none;
+  border-radius: 8px;
+  font-weight: bold;
+  font-size: 14px;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+  color: white;
+}
+
+.btn-save {
+  background: linear-gradient(135deg, #28a745, #20c997);
+}
+
+.btn-cancel {
+  background: linear-gradient(135deg, #6c757d, #495057);
+}
+
+button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+.info-box {
+  background: rgba(33, 150, 243, 0.2);
+  border: 2px solid rgba(33, 150, 243, 0.5);
+  color: #2196f3;
+  padding: 12px;
+  border-radius: 8px;
+  margin-top: 20px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+  <h1>🔧 Configurar PoweRemote</h1>
+  <p class="subtitle">Modo de configuración local</p>
+  
+  <div class="alert">
+    ⚠️ El dispositivo NO pudo conectar a la red WiFi configurada. 
+    Configura las credenciales correctas para continuar.
+  </div>
+
+  <form action="/config" method="POST">
+    <div class="form-group">
+      <label for="ssid">Nombre de Red (SSID)</label>
+      <input type="text" id="ssid" name="ssid" placeholder="Ej: MiRed" required>
+    </div>
+
+    <div class="form-group">
+      <label for="password">Contraseña WiFi</label>
+      <input type="password" id="password" name="password" placeholder="Mín. 8 caracteres" required>
+    </div>
+
+    <div class="button-group">
+      <button type="submit" class="btn-save">💾 Guardar y Conectar</button>
+    </div>
+  </form>
+
+  <div class="info-box">
+    <strong>💡 Instrucciones:</strong><br>
+    1. Ingresa el nombre y contraseña de tu red WiFi<br>
+    2. Haz clic en "Guardar y Conectar"<br>
+    3. El dispositivo se reconectará automáticamente<br>
+    4. Una vez conectado, accede a la interfaz principal
+  </div>
+</div>
+
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
 }
 
 // ============================================================================
@@ -529,26 +1135,24 @@ void setup() {
     printWiFiStatus();
     digitalWrite(STATUS_LED_PIN, HIGH);
   } else {
-    Serial.println("[WiFi] ❌ No conectado. El sistema continuará intentando reconectar.");
+    Serial.println("[WiFi] ❌ No conectado. Iniciando modo Access Point...");
     digitalWrite(STATUS_LED_PIN, LOW);
+    setupAP();
   }
 
-  // Configurar rutas HTTP
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/power", HTTP_POST, handlePower);
-  server.on("/forceoff", HTTP_POST, handleForceOff);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.onNotFound(handleNotFound);
-
+  // Iniciar servidor primero
   server.begin();
   Serial.println("[HTTP] ✓ Servidor web iniciado en puerto 80");
+  
+  // Registrar rutas HTTP DESPUÉS de iniciar el servidor
+  registerHTTPRoutes();
 
   // Configurar OTA
   setupOTA();
 
   Serial.println();
   Serial.println("╔═══════════════════════════════════════════════════════╗");
-  Serial.println("║          🚀 SISTEMA LISTO PARA OPERAR 🚀            ║");
+  Serial.println("║          🚀 SISTEMA LISTO PARA OPERAR 🚀             ║");
   Serial.println("╚═══════════════════════════════════════════════════════╝");
   Serial.println();
 }
@@ -563,6 +1167,9 @@ void loop() {
 
   // Reconectar WiFi si es necesario
   reconnectWiFi();
+  
+  // Si está en modo AP, verificar disponibilidad de red
+  checkNetworkInAPMode();
 
   // Actualizar LED de estado
   updateStatusLED();
@@ -572,3 +1179,4 @@ void loop() {
 
   delay(10);  // Pequeño delay para evitar saturar el procesador
 }
+ 
