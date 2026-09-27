@@ -14,10 +14,12 @@
   const char* AP_PASSWORD = "CHANGE_ME_AP";
   const char* WIFI_SSID = "YOUR_WIFI_SSID";
   const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+  const char* AMBI_IP = "192.168.0.3";
 #endif
 
 #include <Matter.h>
 #include <MatterEndpoints/MatterOnOffLight.h>
+#include "ping/ping_sock.h"
 
 // ============================================================================
 // CONFIGURACIÓN SEGURA
@@ -78,6 +80,20 @@ bool led_state = false;
 unsigned long last_ap_check = 0;
 const unsigned long AP_CHECK_INTERVAL = 10000;  // Revisar red cada 10s en modo AP
 
+// Estado del PC detectado mediante la ESP32 Ambi en la red local.
+enum PcPowerState { PC_UNKNOWN, PC_ON, PC_OFF };
+PcPowerState pc_power_state = PC_UNKNOWN;
+unsigned long last_ambi_ping = 0;
+const unsigned long AMBI_PING_INTERVAL = 10000;
+const uint8_t AMBI_ON_CONFIRMATIONS = 2;
+const uint8_t AMBI_OFF_CONFIRMATIONS = 3;
+uint8_t ambi_success_count = 0;
+uint8_t ambi_failure_count = 0;
+volatile bool ambi_ping_reply = false;
+volatile bool ambi_ping_finished = false;
+bool ambi_ping_active = false;
+esp_ping_handle_t ambi_ping_handle = nullptr;
+
 // ============================================================================
 // CALLBACK MATTER (Google Home / Asistentes)
 // ============================================================================
@@ -93,6 +109,84 @@ bool onMatterChange(bool state) {
 }
 
 // ============================================================================
+void onAmbiPingSuccess(esp_ping_handle_t hdl, void *args) {
+  ambi_ping_reply = true;
+}
+
+void onAmbiPingEnd(esp_ping_handle_t hdl, void *args) {
+  ambi_ping_finished = true;
+}
+
+const char* getPcPowerStateLabel() {
+  if (pc_power_state == PC_ON) return "ENCENDIDO";
+  if (pc_power_state == PC_OFF) return "APAGADO";
+  return "VERIFICANDO";
+}
+
+void beginAmbiPing() {
+  if (WiFi.status() != WL_CONNECTED || ambi_ping_active) return;
+
+  IPAddress ambi_address;
+  if (!ambi_address.fromString(AMBI_IP)) {
+    Serial.println("[PC] IP de Ambi inválida");
+    return;
+  }
+
+  ip_addr_t target_addr;
+  target_addr.type = IPADDR_TYPE_V4;
+  target_addr.u_addr.ip4.addr = (uint32_t)ambi_address;
+
+  esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
+  ping_config.target_addr = target_addr;
+  ping_config.count = 1;
+  ping_config.timeout_ms = 1000;
+
+  esp_ping_callbacks_t callbacks = {};
+  callbacks.on_ping_success = onAmbiPingSuccess;
+  callbacks.on_ping_end = onAmbiPingEnd;
+
+  ambi_ping_reply = false;
+  ambi_ping_finished = false;
+  if (esp_ping_new_session(&ping_config, &callbacks, &ambi_ping_handle) != ESP_OK) {
+    Serial.println("[PC] No se pudo iniciar ping a Ambi");
+    return;
+  }
+
+  ambi_ping_active = true;
+  esp_ping_start(ambi_ping_handle);
+}
+
+void updatePcPowerState() {
+  unsigned long now = millis();
+
+  if (ambi_ping_active && ambi_ping_finished) {
+    esp_ping_delete_session(ambi_ping_handle);
+    ambi_ping_handle = nullptr;
+    ambi_ping_active = false;
+
+    if (ambi_ping_reply) {
+      if (ambi_success_count < AMBI_ON_CONFIRMATIONS) ambi_success_count++;
+      ambi_failure_count = 0;
+      if (ambi_success_count >= AMBI_ON_CONFIRMATIONS && pc_power_state != PC_ON) {
+        pc_power_state = PC_ON;
+        Serial.println("[PC] ✓ ENCENDIDO (Ambi responde en la red)");
+      }
+    } else {
+      if (ambi_failure_count < AMBI_OFF_CONFIRMATIONS) ambi_failure_count++;
+      ambi_success_count = 0;
+      if (ambi_failure_count >= AMBI_OFF_CONFIRMATIONS && pc_power_state != PC_OFF) {
+        pc_power_state = PC_OFF;
+        Serial.println("[PC] ○ APAGADO (Ambi no responde)");
+      }
+    }
+  }
+
+  if (!ambi_ping_active && now - last_ambi_ping >= AMBI_PING_INTERVAL) {
+    last_ambi_ping = now;
+    beginAmbiPing();
+  }
+}
+
 // FUNCIONES DE LED Y ESTADO
 // ============================================================================
 
@@ -400,6 +494,9 @@ button:active {
 
   html += matter_status_html;
 
+  String pc_color = pc_power_state == PC_ON ? "#4ade80" : (pc_power_state == PC_OFF ? "#f87171" : "#facc15");
+  html += "<div style='color: " + pc_color + "; font-size: 14px; margin-bottom: 15px;'>PC: <strong>" + getPcPowerStateLabel() + "</strong></div>";
+
   html += R"rawliteral(
   <div class="buttons">
     <form action="/power" method="post" style="width: 100%;">
@@ -516,7 +613,8 @@ void handleStatus() {
   status += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   status += "\"uptime\":" + String(millis() / 1000) + ",";
   status += "\"matter_commissioned\":" + String(Matter.isDeviceCommissioned() ? "true" : "false") + ",";
-  status += "\"matter_pairing_code\":\"" + Matter.getManualPairingCode() + "\"";
+  status += "\"matter_pairing_code\":\"" + Matter.getManualPairingCode() + "\",";
+  status += "\"pc_power\":\"" + String(getPcPowerStateLabel()) + "\"";
   status += "}";
 
   server.send(200, "application/json", status);
@@ -1256,6 +1354,9 @@ void loop() {
   
   // Si está en modo AP, verificar disponibilidad de red
   checkNetworkInAPMode();
+
+  // Detectar si el PC está encendido mediante la ESP32 Ambi.
+  updatePcPowerState();
 
   // Actualizar LED de estado
   updateStatusLED();

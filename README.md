@@ -99,6 +99,18 @@ GET /status
 
 La respuesta incluye el estado Wi‑Fi, IP, potencia de señal y tiempo de actividad.
 
+## Detección de estado del PC
+
+PoweRemote consulta por ICMP cada 10 segundos la ESP32 Ambi configurada en `AMBI_IP`. Como Ambi se apaga junto con el PC, dos respuestas consecutivas marcan el PC como **encendido** y tres fallos consecutivos lo marcan como **apagado**.
+
+La dirección se define sólo en `secrets.h`:
+
+```cpp
+const char* AMBI_IP = "192.168.0.3";
+```
+
+El estado aparece en la interfaz web, en `GET /status` como `pc_power` y en el monitor serial. Ambi no requiere ningún cambio.
+
 ## Actualización OTA
 
 Una vez que el ESP32 esté conectado a la misma red que tu computador, aparecerá como un puerto de red en el IDE de Arduino. Selecciónalo, conserva la misma placa y carga el firmware. La clave OTA es la misma definida en `http_password`.

@@ -8,3 +8,4 @@ const char* AP_SSID = "PoweRemote-Setup";
 const char* AP_PASSWORD = "CHANGE_ME_AP";
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* AMBI_IP = "192.168.0.3";
