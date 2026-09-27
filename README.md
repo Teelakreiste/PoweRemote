@@ -50,7 +50,7 @@ Las bibliotecas incluidas con el paquete de ESP32 son:
 
 ## Primera configuración
 
-El firmware no contiene credenciales reales. Antes de cargarlo, cambia los marcadores del archivo `app.ino`:
+El firmware no contiene credenciales reales. Antes de cargarlo, copia `secrets.example.h` como `secrets.h` y cambia sus marcadores:
 
 ```cpp
 const char* http_username = "admin";
@@ -63,7 +63,7 @@ ssid_stored = "YOUR_WIFI_SSID";
 password_stored = "YOUR_WIFI_PASSWORD";
 ```
 
-Usa contraseñas robustas. No publiques el archivo con valores reales: puedes conservarlos sólo en tu copia local o gestionarlos mediante una configuración privada.
+Usa contraseñas robustas. No publiques `secrets.h`: está incluido en `.gitignore` y queda sólo en tu copia local.
 
 Al arrancar, el ESP32 intenta unirse a la red configurada. Si tiene éxito, consulta la dirección IP mostrada en el monitor serial y abre:
 

@@ -1,2 +1,4 @@
 app/
 app - copia/
+*.local.ino
+secrets.h

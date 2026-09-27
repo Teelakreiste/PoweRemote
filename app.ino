@@ -2,6 +2,9 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
+#include "secrets.h"
+#include <Matter.h>
+#include <MatterEndpoints/MatterOnOffLight.h>
 
 // ============================================================================
 // CONFIGURACIÓN SEGURA
@@ -17,15 +20,26 @@ String ssid_stored = "";
 String password_stored = "";
 
 // Autenticación HTTP (cambiar en producción)
-const char* http_username = "admin";
-const char* http_password = "CHANGE_ME";
+const char* http_username = HTTP_USERNAME;
+const char* http_password = HTTP_PASSWORD;
 
 // Modo AP (Access Point)
-const char* ap_ssid = "PoweRemote-Setup";
-const char* ap_password = "CHANGE_ME_AP";
+const char* ap_ssid = AP_SSID;
+const char* ap_password = AP_PASSWORD;
 bool ap_mode = false;
 
 WebServer server(80);
+
+// Endpoint Matter de tipo On/Off
+MatterOnOffLight matter_pc;
+
+// Declaraciones previas de funciones
+void powerPress();
+void forceOff();
+void setupAP();
+void registerHTTPRoutes();
+void handleAPRoot();
+String base64_encode_simple(const uint8_t* data, size_t len);
 
 // ============================================================================
 // ESTRUCTURA DE ALMACENAMIENTO EN EEPROM
@@ -50,6 +64,20 @@ const unsigned long WIFI_CHECK_INTERVAL = 30000;  // Revisar cada 30s
 bool led_state = false;
 unsigned long last_ap_check = 0;
 const unsigned long AP_CHECK_INTERVAL = 10000;  // Revisar red cada 10s en modo AP
+
+// ============================================================================
+// CALLBACK MATTER (Google Home / Asistentes)
+// ============================================================================
+
+bool onMatterChange(bool state) {
+  Serial.printf("\n[Matter] Comando recibido desde Google Home: %s\n", state ? "ON" : "OFF");
+  
+  // Tanto ON como OFF realizan una pulsación corta del botón de encendido (300ms)
+  // El PC gestionará el arranque (si está apagado) o el apagado limpio por SO (si está encendido)
+  powerPress();
+  
+  return true;
+}
 
 // ============================================================================
 // FUNCIONES DE LED Y ESTADO
@@ -172,7 +200,6 @@ bool checkAuth() {
   String expected_credentials = String(http_username) + ":" + String(http_password);
   
   // Codificar manualmente en base64 para comparación
-  // base64: A-Z, a-z, 0-9, +, /, =
   String encoded_expected = base64_encode_simple((uint8_t*)expected_credentials.c_str(), expected_credentials.length());
   
   if (encoded_credentials != encoded_expected) {
@@ -221,18 +248,18 @@ String base64_encode_simple(const uint8_t* data, size_t len) {
 // ============================================================================
 
 void powerPress() {
-  Serial.println("[RELÉ] Pulsación corta (150ms)");
-  digitalWrite(RELAY_PIN, LOW);
+  Serial.println("[RELÉ] Pulsación corta (300ms)");
+  digitalWrite(RELAY_PIN, LOW);   // Relé activo (lógica en LOW)
   delay(300);
-  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(RELAY_PIN, HIGH);  // Relé desactivado
   Serial.println("[RELÉ] ✓ Pulsación completada");
 }
 
 void forceOff() {
   Serial.println("[RELÉ] Apagado forzado (6s)");
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(RELAY_PIN, LOW);   // Relé activo
   delay(6000);
-  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(RELAY_PIN, HIGH);  // Relé desactivado
   Serial.println("[RELÉ] ✓ Apagado forzado completado");
 }
 
@@ -242,6 +269,15 @@ void forceOff() {
 
 void handleRoot() {
   if (!checkAuth()) return;
+
+  String matter_status_html = "";
+  if (Matter.isDeviceCommissioned()) {
+    matter_status_html = "<div style='color: #4ade80; font-size: 13px; margin-bottom: 15px;'>✓ Matter Vinculado a Google Home</div>";
+  } else {
+    String pairingCode = Matter.getManualPairingCode();
+    matter_status_html = "<div style='background: rgba(33, 150, 243, 0.2); padding: 10px; border-radius: 8px; font-size: 13px; margin-bottom: 15px; color: #64b5f6;'>"
+                         "📱 <strong>Código Matter Google Home:</strong> " + pairingCode + "</div>";
+  }
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -288,7 +324,7 @@ h1 {
 .status {
   color: #4ade80;
   font-size: 14px;
-  margin-bottom: 30px;
+  margin-bottom: 20px;
   padding: 10px;
   background: rgba(0, 0, 0, 0.2);
   border-radius: 10px;
@@ -347,14 +383,18 @@ button:active {
 <div class="container">
   <h1>🎮 Control Remoto PC</h1>
   <div class="status">✓ Sistema activo y protegido</div>
-  
+)rawliteral";
+
+  html += matter_status_html;
+
+  html += R"rawliteral(
   <div class="buttons">
     <form action="/power" method="post" style="width: 100%;">
-      <button type="submit" class="power-btn">⚡ ENCENDER PC</button>
+      <button type="submit" class="power-btn">⚡ ENCENDER / APAGAR PC</button>
     </form>
     
     <form action="/forceoff" method="post" style="width: 100%;">
-      <button type="submit" class="force-btn">🛑 APAGADO FORZADO</button>
+      <button type="submit" class="force-btn">🛑 APAGADO FORZADO (6s)</button>
     </form>
 
     <a href="/config" style="width: 100%; text-decoration: none;">
@@ -363,7 +403,7 @@ button:active {
   </div>
   
   <div class="info">
-    Interfaz de control segura | Autenticación requerida
+    Interfaz de control segura | Compatible con Matter y Google Home
   </div>
 </div>
 
@@ -380,6 +420,11 @@ void handlePower() {
   
   powerPress();
   
+  // Sincronizar estado lógico de Matter si está inicializado
+  if (Matter.isDeviceCommissioned()) {
+    matter_pc.setOnOff(!matter_pc.getOnOff());
+  }
+
   String response = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -395,8 +440,8 @@ a { color: #667eea; text-decoration: none; }
 </head>
 <body>
 <div class="success">
-  <h2>✓ Pulsación enviada</h2>
-  <p>El PC debe encenderse en breves momentos</p>
+  <h2>✓ Pulsación enviada (300ms)</h2>
+  <p>El botón de encendido del PC ha sido accionado.</p>
 </div>
 <a href="/">← Volver</a>
 </body>
@@ -412,6 +457,11 @@ void handleForceOff() {
   
   forceOff();
   
+  // Sincronizar estado lógico de Matter si está disponible
+  if (Matter.isDeviceCommissioned()) {
+    matter_pc.setOnOff(false);
+  }
+
   String response = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -427,8 +477,8 @@ a { color: #667eea; text-decoration: none; }
 </head>
 <body>
 <div class="warning">
-  <h2>⚠️ Apagado forzado enviado</h2>
-  <p>El PC se apagará en 6 segundos</p>
+  <h2>⚠️ Apagado forzado enviado (6s)</h2>
+  <p>El PC se apagará por corte sostenido del botón de encendido.</p>
 </div>
 <a href="/">← Volver</a>
 </body>
@@ -451,7 +501,9 @@ void handleStatus() {
   status += "\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? "CONECTADO" : "DESCONECTADO") + "\",";
   status += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   status += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  status += "\"uptime\":" + String(millis() / 1000) + "";
+  status += "\"uptime\":" + String(millis() / 1000) + ",";
+  status += "\"matter_commissioned\":" + String(Matter.isDeviceCommissioned() ? "true" : "false") + ",";
+  status += "\"matter_pairing_code\":\"" + Matter.getManualPairingCode() + "\"";
   status += "}";
 
   server.send(200, "application/json", status);
@@ -1097,14 +1149,14 @@ void setup() {
   Serial.println("\n\n");
   Serial.println("╔═══════════════════════════════════════════════════════╗");
   Serial.println("║         🎮 CONTROL REMOTO PC - SISTEMA MEJORADO       ║");
-  Serial.println("║              Versión 2.0 - Segura & Robusta          ║");
+  Serial.println("║          Versión 2.0 + Soporte Matter / Google Home   ║");
   Serial.println("╚═══════════════════════════════════════════════════════╝");
   Serial.println();
 
   // Inicializar pines
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(STATUS_LED_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);    // Relé desactivado
+  digitalWrite(RELAY_PIN, HIGH);    // Relé desactivado (lógica en LOW)
   digitalWrite(STATUS_LED_PIN, LOW); // LED apagado inicialmente
 
   // Inicializar EEPROM
@@ -1113,8 +1165,8 @@ void setup() {
   // Cargar configuración (si existe) o usar por defecto
   if (!loadConfig()) {
     Serial.println("[CONFIG] Usando valores por defecto");
-    ssid_stored = "YOUR_WIFI_SSID";
-    password_stored = "YOUR_WIFI_PASSWORD";
+    ssid_stored = WIFI_SSID;
+    password_stored = WIFI_PASSWORD;
   }
 
   Serial.println("\n[WiFi] Conectando a: " + ssid_stored);
@@ -1150,6 +1202,27 @@ void setup() {
   // Configurar OTA
   setupOTA();
 
+  // Configurar e inicializar Matter
+  Serial.println("\n[Matter] Configurando endpoint On/Off...");
+  matter_pc.begin();
+  matter_pc.onChange(onMatterChange);
+  
+  Serial.println("[Matter] Iniciando stack Matter...");
+  Matter.begin();
+
+  if (!Matter.isDeviceCommissioned()) {
+    Serial.println();
+    Serial.println("╔═══════════════════════════════════════════════════════╗");
+    Serial.println("║     📱 DISPOSITIVO MATTER LISTO PARA EMPAREJAR        ║");
+    Serial.println("╠═══════════════════════════════════════════════════════╣");
+    Serial.printf("║ Código Manual: %-38s ║\n", Matter.getManualPairingCode().c_str());
+    Serial.printf("║ QR Code URL:   %-38s ║\n", Matter.getOnboardingQRCodeUrl().c_str());
+    Serial.println("║ Abre Google Home -> Añadir dispositivo -> Matter     ║");
+    Serial.println("╚═══════════════════════════════════════════════════════╝\n");
+  } else {
+    Serial.println("[Matter] ✓ Dispositivo ya emparejado con red Matter (Google Home)");
+  }
+
   Serial.println();
   Serial.println("╔═══════════════════════════════════════════════════════╗");
   Serial.println("║          🚀 SISTEMA LISTO PARA OPERAR 🚀             ║");
@@ -1179,4 +1252,3 @@ void loop() {
 
   delay(10);  // Pequeño delay para evitar saturar el procesador
 }
- 
