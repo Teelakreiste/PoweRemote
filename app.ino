@@ -379,7 +379,10 @@ void handleRoot() {
 
   String matter_status_html = "";
   if (Matter.isDeviceCommissioned()) {
-    matter_status_html = "<div style='color: #4ade80; font-size: 13px; margin-bottom: 15px;'>✓ Matter Vinculado a Google Home</div>";
+    matter_status_html = "<div style='color: #4ade80; font-size: 13px; margin-bottom: 10px;'>✓ Matter Vinculado a Google Home</div>"
+                         "<form action='/matter-reset' method='post' style='margin-bottom: 15px;'>"
+                         "  <button type='submit' style='padding: 8px 16px; font-size: 12px; background: rgba(220, 53, 69, 0.8); border-radius: 6px; color: white; border: none; cursor: pointer;'>🔄 Restablecer Matter / Desvincular</button>"
+                         "</form>";
   } else {
     String pairingCode = Matter.getManualPairingCode();
     matter_status_html = "<div style='background: rgba(33, 150, 243, 0.2); padding: 10px; border-radius: 8px; font-size: 13px; margin-bottom: 15px; color: #64b5f6;'>"
@@ -597,6 +600,41 @@ a { color: #667eea; text-decoration: none; }
 
   server.send(200, "text/html", response);
   Serial.println("[HTTP] POST /forceoff - Comando ejecutado");
+}
+
+void handleMatterReset() {
+  if (!checkAuth()) return;
+  
+  Serial.println("\n[Matter] 🔄 Solicitud de restablecimiento recibida...");
+  Serial.println("[Matter] Ejecutando Matter.decommission()...");
+  Matter.decommission();
+  
+  String response = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Matter Restablecido</title>
+<style>
+body { font-family: Arial; text-align: center; margin-top: 50px; background: #f0f0f0; }
+.info { background: #2196f3; color: white; padding: 20px; border-radius: 10px; margin: 20px auto; max-width: 400px; }
+a { color: #667eea; text-decoration: none; display: block; margin-top: 20px; }
+</style>
+</head>
+<body>
+<div class="info">
+  <h2>🔄 Matter Restablecido</h2>
+  <p>El dispositivo se reiniciará en 3 segundos y volverá a mostrar el código de emparejamiento.</p>
+</div>
+<a href="/">← Volver</a>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", response);
+  delay(3000);
+  ESP.restart();
 }
 
 void handleNotFound() {
@@ -1038,6 +1076,7 @@ void registerHTTPRoutes() {
   server.on("/", HTTP_GET, ap_mode ? handleAPRoot : handleRoot);
   server.on("/power", HTTP_POST, handlePower);
   server.on("/forceoff", HTTP_POST, handleForceOff);
+  server.on("/matter-reset", HTTP_POST, handleMatterReset);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/config", HTTP_GET, handleConfig);
   server.on("/config", HTTP_POST, handleConfig);
