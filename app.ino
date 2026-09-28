@@ -2,6 +2,8 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
+#include <esp_ping.h>
+#include <ping/ping_sock.h>
 
 #if __has_include("secrets.h")
   #include "secrets.h"
@@ -14,12 +16,11 @@
   const char* AP_PASSWORD = "CHANGE_ME_AP";
   const char* WIFI_SSID = "YOUR_WIFI_SSID";
   const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-  const char* AMBI_IP = "192.168.0.3";
+  const char* AMBI_IP = "192.168.1.100";
 #endif
 
 #include <Matter.h>
 #include <MatterEndpoints/MatterOnOffLight.h>
-#include "ping/ping_sock.h"
 
 // ============================================================================
 // CONFIGURACIÓN SEGURA
@@ -84,7 +85,7 @@ const unsigned long AP_CHECK_INTERVAL = 10000;  // Revisar red cada 10s en modo 
 enum PcPowerState { PC_UNKNOWN, PC_ON, PC_OFF };
 PcPowerState pc_power_state = PC_UNKNOWN;
 unsigned long last_ambi_ping = 0;
-const unsigned long AMBI_PING_INTERVAL = 10000;
+const unsigned long AMBI_PING_INTERVAL = 5000;  // Sondeo cada 5s para mayor agilidad
 const uint8_t AMBI_ON_CONFIRMATIONS = 2;
 const uint8_t AMBI_OFF_CONFIRMATIONS = 3;
 uint8_t ambi_success_count = 0;
@@ -98,17 +99,35 @@ esp_ping_handle_t ambi_ping_handle = nullptr;
 // CALLBACK MATTER (Google Home / Asistentes)
 // ============================================================================
 
-bool onMatterChange(bool state) {
-  Serial.printf("\n[Matter] Comando recibido desde Google Home: %s\n", state ? "ON" : "OFF");
+bool onMatterChange(bool targetState) {
+  Serial.printf("\n[Matter] Comando recibido desde Google Home: %s (Estado detectado: %s)\n", 
+                targetState ? "ON" : "OFF", getPcPowerStateLabel());
   
-  // Tanto ON como OFF realizan una pulsación corta del botón de encendido (300ms)
-  // El PC gestionará el arranque (si está apagado) o el apagado limpio por SO (si está encendido)
-  powerPress();
+  if (targetState) {
+    // Si Google Home solicita encender pero ya está encendido, no pulsar botón
+    if (pc_power_state == PC_ON) {
+      Serial.println("[Matter] El PC ya está ENCENDIDO. Ignorando pulsación.");
+      return true;
+    }
+    Serial.println("[Matter] Solicitud de encendido: accionando pulsador...");
+    powerPress();
+  } else {
+    // Si Google Home solicita apagar pero ya está apagado, no pulsar botón
+    if (pc_power_state == PC_OFF) {
+      Serial.println("[Matter] El PC ya está APAGADO. Ignorando pulsación.");
+      return true;
+    }
+    Serial.println("[Matter] Solicitud de apagado: accionando pulsador...");
+    powerPress();
+  }
   
   return true;
 }
 
 // ============================================================================
+// PING A ESP32 AMBI PARA DETECTAR ESTADO DEL PC
+// ============================================================================
+
 void onAmbiPingSuccess(esp_ping_handle_t hdl, void *args) {
   ambi_ping_reply = true;
 }
@@ -167,16 +186,32 @@ void updatePcPowerState() {
     if (ambi_ping_reply) {
       if (ambi_success_count < AMBI_ON_CONFIRMATIONS) ambi_success_count++;
       ambi_failure_count = 0;
-      if (ambi_success_count >= AMBI_ON_CONFIRMATIONS && pc_power_state != PC_ON) {
-        pc_power_state = PC_ON;
-        Serial.println("[PC] ✓ ENCENDIDO (Ambi responde en la red)");
+      if (ambi_success_count >= AMBI_ON_CONFIRMATIONS) {
+        if (pc_power_state != PC_ON) {
+          pc_power_state = PC_ON;
+          Serial.println("[PC] ✓ ENCENDIDO (Ambi responde en la red)");
+        }
+        
+        // Sincronizar Matter de forma continua si difiere del estado real
+        if (Matter.isDeviceCommissioned() && !matter_pc.getOnOff()) {
+          matter_pc.setOnOff(true);
+          Serial.println("[Matter] ✓ Estado sincronizado con Google Home: ON");
+        }
       }
     } else {
       if (ambi_failure_count < AMBI_OFF_CONFIRMATIONS) ambi_failure_count++;
       ambi_success_count = 0;
-      if (ambi_failure_count >= AMBI_OFF_CONFIRMATIONS && pc_power_state != PC_OFF) {
-        pc_power_state = PC_OFF;
-        Serial.println("[PC] ○ APAGADO (Ambi no responde)");
+      if (ambi_failure_count >= AMBI_OFF_CONFIRMATIONS) {
+        if (pc_power_state != PC_OFF) {
+          pc_power_state = PC_OFF;
+          Serial.println("[PC] ○ APAGADO (Ambi no responde)");
+        }
+        
+        // Sincronizar Matter de forma continua si difiere del estado real
+        if (Matter.isDeviceCommissioned() && matter_pc.getOnOff()) {
+          matter_pc.setOnOff(false);
+          Serial.println("[Matter] ✓ Estado sincronizado con Google Home: OFF");
+        }
       }
     }
   }
@@ -187,6 +222,7 @@ void updatePcPowerState() {
   }
 }
 
+// ============================================================================
 // FUNCIONES DE LED Y ESTADO
 // ============================================================================
 
@@ -379,15 +415,18 @@ void handleRoot() {
 
   String matter_status_html = "";
   if (Matter.isDeviceCommissioned()) {
-    matter_status_html = "<div style='color: #4ade80; font-size: 13px; margin-bottom: 10px;'>✓ Matter Vinculado a Google Home</div>"
-                         "<form action='/matter-reset' method='post' style='margin-bottom: 15px;'>"
+    matter_status_html = "<div id='matter-commissioned-box' style='color: #4ade80; font-size: 13px; margin-bottom: 10px;'>✓ Matter Vinculado a Google Home</div>"
+                         "<form id='matter-reset-form' action='/matter-reset' method='post' style='margin-bottom: 15px;'>"
                          "  <button type='submit' style='padding: 8px 16px; font-size: 12px; background: rgba(220, 53, 69, 0.8); border-radius: 6px; color: white; border: none; cursor: pointer;'>🔄 Restablecer Matter / Desvincular</button>"
                          "</form>";
   } else {
     String pairingCode = Matter.getManualPairingCode();
-    matter_status_html = "<div style='background: rgba(33, 150, 243, 0.2); padding: 10px; border-radius: 8px; font-size: 13px; margin-bottom: 15px; color: #64b5f6;'>"
-                         "📱 <strong>Código Matter Google Home:</strong> " + pairingCode + "</div>";
+    matter_status_html = "<div id='matter-uncommissioned-box' style='background: rgba(33, 150, 243, 0.2); padding: 10px; border-radius: 8px; font-size: 13px; margin-bottom: 15px; color: #64b5f6;'>"
+                         "📱 <strong>Código Matter Google Home:</strong> <span id='matter-code-val'>" + pairingCode + "</span></div>";
   }
+
+  String initial_pc_color = pc_power_state == PC_ON ? "rgba(74, 222, 128, 0.2)" : (pc_power_state == PC_OFF ? "rgba(248, 113, 113, 0.2)" : "rgba(250, 204, 21, 0.2)");
+  String initial_text_color = pc_power_state == PC_ON ? "#4ade80" : (pc_power_state == PC_OFF ? "#f87171" : "#facc15");
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -418,7 +457,7 @@ body {
   background: rgba(255, 255, 255, 0.1);
   backdrop-filter: blur(10px);
   border-radius: 20px;
-  padding: 40px;
+  padding: 35px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
   text-align: center;
   max-width: 500px;
@@ -427,28 +466,55 @@ body {
 
 h1 {
   color: white;
-  margin-bottom: 10px;
-  font-size: 32px;
+  margin-bottom: 8px;
+  font-size: 30px;
 }
 
-.status {
+.status-bar {
   color: #4ade80;
-  font-size: 14px;
-  margin-bottom: 20px;
-  padding: 10px;
-  background: rgba(0, 0, 0, 0.2);
+  font-size: 13px;
+  margin-bottom: 18px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.25);
   border-radius: 10px;
+}
+
+.pc-status-card {
+  padding: 14px;
+  border-radius: 12px;
+  margin-bottom: 18px;
+  font-size: 16px;
+  font-weight: bold;
+  transition: all 0.4s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.pulse-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.25); opacity: 1; }
+  100% { transform: scale(0.95); opacity: 0.8; }
 }
 
 .buttons {
   display: flex;
   flex-direction: column;
-  gap: 15px;
+  gap: 14px;
 }
 
 button {
-  padding: 15px 30px;
-  font-size: 18px;
+  padding: 14px 24px;
+  font-size: 17px;
   border: none;
   border-radius: 10px;
   cursor: pointer;
@@ -478,11 +544,28 @@ button:active {
   background: linear-gradient(135deg, #6f42c1, #5a32a3);
 }
 
+.toast {
+  display: none;
+  margin-top: 15px;
+  padding: 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: white;
+  background: rgba(0, 0, 0, 0.5);
+  animation: fadeIn 0.3s;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 .info {
   color: rgba(255, 255, 255, 0.7);
   font-size: 12px;
-  margin-top: 30px;
-  padding-top: 20px;
+  margin-top: 25px;
+  padding-top: 15px;
   border-top: 1px solid rgba(255, 255, 255, 0.2);
 }
 </style>
@@ -492,33 +575,112 @@ button:active {
 
 <div class="container">
   <h1>🎮 Control Remoto PC</h1>
-  <div class="status">✓ Sistema activo y protegido</div>
+  <div class="status-bar" id="sys-status">✓ Sistema activo y protegido</div>
 )rawliteral";
 
   html += matter_status_html;
 
-  String pc_color = pc_power_state == PC_ON ? "#4ade80" : (pc_power_state == PC_OFF ? "#f87171" : "#facc15");
-  html += "<div style='color: " + pc_color + "; font-size: 14px; margin-bottom: 15px;'>PC: <strong>" + getPcPowerStateLabel() + "</strong></div>";
+  html += "<div class='pc-status-card' id='pc-card' style='background: " + initial_pc_color + "; color: " + initial_text_color + "; border: 1px solid " + initial_text_color + ";'>"
+          "<span class='pulse-dot' id='pc-dot' style='background: " + initial_text_color + ";'></span>"
+          "PC: <span id='pc-label'>" + getPcPowerStateLabel() + "</span>"
+          "</div>";
 
   html += R"rawliteral(
   <div class="buttons">
-    <form action="/power" method="post" style="width: 100%;">
-      <button type="submit" class="power-btn">⚡ ENCENDER / APAGAR PC</button>
-    </form>
-    
-    <form action="/forceoff" method="post" style="width: 100%;">
-      <button type="submit" class="force-btn">🛑 APAGADO FORZADO (6s)</button>
-    </form>
+    <button type="button" class="power-btn" id="btn-power" onclick="sendAction('/power', '⚡ Enviando pulsación de encendido/apagado...')">⚡ ENCENDER / APAGAR PC</button>
+    <button type="button" class="force-btn" id="btn-force" onclick="sendAction('/forceoff', '🛑 Enviando apagado forzado (6s)...')">🛑 APAGADO FORZADO (6s)</button>
 
     <a href="/config" style="width: 100%; text-decoration: none;">
       <button type="button" class="config-btn" style="width: 100%;">⚙️ CONFIGURAR WiFi</button>
     </a>
   </div>
   
-  <div class="info">
-    Interfaz de control segura | Compatible con Matter y Google Home
+  <div class="toast" id="toast-msg"></div>
+
+  <div class="info" id="live-info">
+    Sincronización en vivo activa | Compatible con Matter y Google Home
   </div>
 </div>
+
+<script>
+function showToast(text, color) {
+  const toast = document.getElementById('toast-msg');
+  if (!toast) return;
+  toast.innerText = text;
+  toast.style.background = color || 'rgba(0, 0, 0, 0.6)';
+  toast.style.display = 'block';
+  setTimeout(() => { toast.style.display = 'none'; }, 3500);
+}
+
+function sendAction(endpoint, msg) {
+  showToast(msg, 'rgba(33, 150, 243, 0.8)');
+  fetch(endpoint, { method: 'POST' })
+    .then(res => {
+      if (res.ok) {
+        setTimeout(pollStatus, 500);
+      } else {
+        showToast('❌ Error en el comando (' + res.status + ')', 'rgba(220, 53, 69, 0.8)');
+      }
+    })
+    .catch(err => {
+      showToast('❌ Error de comunicación', 'rgba(220, 53, 69, 0.8)');
+    });
+}
+
+function formatUptime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return (h > 0 ? h + 'h ' : '') + m + 'm ' + s + 's';
+}
+
+function pollStatus() {
+  fetch('/status')
+    .then(res => res.json())
+    .then(data => {
+      // Actualizar tarjeta del PC
+      const pcLabel = document.getElementById('pc-label');
+      const pcCard = document.getElementById('pc-card');
+      const pcDot = document.getElementById('pc-dot');
+      
+      if (pcLabel && pcCard && pcDot) {
+        pcLabel.innerText = data.pc_power;
+        if (data.pc_power === 'ENCENDIDO') {
+          pcCard.style.background = 'rgba(74, 222, 128, 0.2)';
+          pcCard.style.color = '#4ade80';
+          pcCard.style.borderColor = '#4ade80';
+          pcDot.style.background = '#4ade80';
+        } else if (data.pc_power === 'APAGADO') {
+          pcCard.style.background = 'rgba(248, 113, 113, 0.2)';
+          pcCard.style.color = '#f87171';
+          pcCard.style.borderColor = '#f87171';
+          pcDot.style.background = '#f87171';
+        } else {
+          pcCard.style.background = 'rgba(250, 204, 21, 0.2)';
+          pcCard.style.color = '#facc15';
+          pcCard.style.borderColor = '#facc15';
+          pcDot.style.background = '#facc15';
+        }
+      }
+
+      // Actualizar barra de estado del sistema
+      const sysStatus = document.getElementById('sys-status');
+      if (sysStatus) {
+        sysStatus.innerText = '✓ ' + data.wifi + ' | IP: ' + data.ip + ' (' + data.rssi + ' dBm)';
+      }
+
+      // Actualizar info inferior
+      const liveInfo = document.getElementById('live-info');
+      if (liveInfo) {
+        liveInfo.innerText = 'Uptime ESP32: ' + formatUptime(data.uptime) + ' | Matter: ' + (data.matter_commissioned ? 'Vinculado' : 'Listo para emparejar');
+      }
+    })
+    .catch(err => console.debug('Polling error:', err));
+}
+
+// Iniciar sondeo en tiempo real cada 2 segundos
+setInterval(pollStatus, 2000);
+</script>
 
 </body>
 </html>
@@ -532,12 +694,8 @@ void handlePower() {
   if (!checkAuth()) return;
   
   powerPress();
-  
-  // Sincronizar estado lógico de Matter si está inicializado
-  if (Matter.isDeviceCommissioned()) {
-    matter_pc.setOnOff(!matter_pc.getOnOff());
-  }
 
+  // Respuesta JSON rápida para AJAX o fallback HTML
   String response = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -663,7 +821,6 @@ void handleConfig() {
   if (!checkAuth()) return;
 
   if (server.method() == HTTP_GET) {
-    // Mostrar página de configuración
     String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -840,7 +997,6 @@ button:active {
     Serial.println("[HTTP] GET /config - Página de configuración enviada");
 
   } else if (server.method() == HTTP_POST) {
-    // Procesar configuración
     if (!server.hasArg("ssid") || !server.hasArg("password")) {
       server.send(400, "text/plain", "Error: Parámetros faltantes");
       Serial.println("[CONFIG] ❌ Error: Parámetros incompletos");
@@ -850,7 +1006,6 @@ button:active {
     String new_ssid = server.arg("ssid");
     String new_password = server.arg("password");
 
-    // Validar longitudes
     if (new_ssid.length() < 1 || new_ssid.length() > 31) {
       server.send(400, "text/plain", "Error: SSID debe tener 1-31 caracteres");
       Serial.println("[CONFIG] ❌ SSID inválido");
@@ -863,7 +1018,6 @@ button:active {
       return;
     }
 
-    // Guardar configuración
     saveConfig(new_ssid.c_str(), new_password.c_str());
 
     String response = R"rawliteral(
@@ -897,7 +1051,6 @@ a { color: #667eea; text-decoration: none; margin-top: 20px; display: block; }
     Serial.println("[CONFIG] ✓ Nueva red guardada: " + new_ssid);
     Serial.println("[CONFIG] ⏱️  Reiniciando en 3 segundos...");
     
-    // Reiniciar después de 3 segundos
     delay(3000);
     ESP.restart();
   }
@@ -949,15 +1102,11 @@ void exitAPMode() {
   Serial.println("\n[AP→STA] Cambiando de modo Access Point a STA...");
   
   ap_mode = false;
-  
-  // Detener servidor
   server.stop();
   
-  // Cambiar a modo STA
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid_stored.c_str(), password_stored.c_str());
   
-  // Esperar conexión con timeout
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(300);
@@ -977,7 +1126,6 @@ void exitAPMode() {
     return;
   }
   
-  // Reiniciar servidor y reregistrar rutas para STA mode
   server.begin();
   registerHTTPRoutes();
   Serial.println("[HTTP] ✓ Servidor reiniciado en modo STA");
@@ -999,21 +1147,16 @@ void checkNetworkInAPMode() {
   }
   
   last_ap_check = now;
-  
   Serial.println("[AP] Escaneando redes disponibles...");
   
-  // Escanear redes WiFi
   int networks = WiFi.scanNetworks();
-  
   if (networks == 0) {
     Serial.println("[AP] ℹ️  No se encontró la red configurada");
     return;
   }
   
-  // Buscar la red configurada
   for (int i = 0; i < networks; i++) {
     String ssid = WiFi.SSID(i);
-    
     if (ssid == ssid_stored) {
       Serial.println("[AP] ✓ Red disponible: " + ssid);
       Serial.println("[AP] → Intentando cambiar a modo normal...");
@@ -1037,7 +1180,7 @@ void setupOTA() {
   ArduinoOTA.onStart([]() {
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? "FIRMWARE" : "FILESYSTEM";
     Serial.println("[OTA] Iniciando actualización: " + type);
-    digitalWrite(STATUS_LED_PIN, LOW);  // Apagar LED durante actualización
+    digitalWrite(STATUS_LED_PIN, LOW);
   });
 
   ArduinoOTA.onEnd([]() {
@@ -1072,7 +1215,6 @@ void setupOTA() {
 // ============================================================================
 
 void registerHTTPRoutes() {
-  // Registrar rutas según el modo (se sobrescriben automáticamente)
   server.on("/", HTTP_GET, ap_mode ? handleAPRoot : handleRoot);
   server.on("/power", HTTP_POST, handlePower);
   server.on("/forceoff", HTTP_POST, handleForceOff);
@@ -1304,9 +1446,12 @@ void setup() {
   Serial.println();
 
   // Inicializar pines
+  // IMPORTANTE: Escribir HIGH antes de declarar OUTPUT para evitar que el relé active un pulso en LOW al arrancar
+  digitalWrite(RELAY_PIN, HIGH);
   pinMode(RELAY_PIN, OUTPUT);
-  pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);    // Relé desactivado (lógica en LOW)
+  
+  pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, LOW); // LED apagado inicialmente
 
   // Inicializar EEPROM
@@ -1394,7 +1539,7 @@ void loop() {
   // Si está en modo AP, verificar disponibilidad de red
   checkNetworkInAPMode();
 
-  // Detectar si el PC está encendido mediante la ESP32 Ambi.
+  // Detectar si el PC está encendido mediante la ESP32 Ambi y sincronizar Matter
   updatePcPowerState();
 
   // Actualizar LED de estado
